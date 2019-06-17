@@ -89,6 +89,15 @@ func WithAuthCallHTTPParams(values url.Values) AuthenticateUserOption {
 
 // AuthenticateUser starts the login process
 func (nsa *NoServerAuth) AuthenticateUser(oauthConfig *oauth2.Config, options ...AuthenticateUserOption) (*AuthorizedClient, error) {
+	// add transport for self-signed certificate to context
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	sslcli := &http.Client{Transport: tr}
+	return nsa.AuthenticateUserWithClient(oauthConfig, sslcli, options...)
+}
+// AuthenticateUser starts the login process, with specified httpclient
+func (nsa *NoServerAuth) AuthenticateUserWithClient(oauthConfig *oauth2.Config, httpClient *http.Client, options ...AuthenticateUserOption) (*AuthorizedClient, error) {
 	// validate params
 	if oauthConfig == nil {
 		return nil, stacktrace.NewError("oauthConfig can't be nil")
@@ -99,12 +108,7 @@ func (nsa *NoServerAuth) AuthenticateUser(oauthConfig *oauth2.Config, options ..
 		processConfigFunc(&optionsConfig)
 	}
 	
-	// add transport for self-signed certificate to context
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}
-	sslcli := &http.Client{Transport: tr}
-	ctx := context.WithValue(context.Background(), oauth2.HTTPClient, sslcli)
+	ctx := context.WithValue(context.Background(), oauth2.HTTPClient, httpClient)
 
 	// Redirect user to consent page to ask for permission
 	// for the scopes specified above.
