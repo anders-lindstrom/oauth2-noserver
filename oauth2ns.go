@@ -23,16 +23,57 @@ type AuthorizedClient struct {
 }
 
 const (
-	// IP is the ip of this machine that will be called back in the browser. It may not be a hostname.
-	// If IP is not 127.0.0.1 DEVICE_NAME must be set. It can be any short string.
-	IP          = "127.0.0.1"
-	DEVICE_NAME = ""
-	// PORT is the port that the temporary oauth server will listen on
-	PORT = 14565
-	// seconds to wait before giving up on auth and exiting
-	authTimeout                = 120
 	oauthStateStringContextKey = 987
 )
+
+type NoServerAuth struct {
+	// IP is the ip of this machine that will be called back in the browser. It may not be a hostname.
+	// If IP is not 127.0.0.1 DEVICE_NAME must be set. It can be any short string.
+	ip string
+	deviceName string
+	// PORT is the port that the temporary oauth server will listen on
+	port int
+	// redirect path
+	redirectPath string
+	// a redirectUrl, set explicitly - leave as "" if wanting to use ip/port
+	redirectUrl string
+	// seconds to wait before giving up on auth and exiting
+	authTimeout time.Duration
+}
+func NewNoServerAuth() *NoServerAuth{
+	return &NoServerAuth{
+		ip: "127.0.0.1",
+		redirectPath: "/oauth/callback",
+		deviceName: "",
+		port: 14565,
+		authTimeout: 120,
+	}
+}
+func NewNoServerAuthFromRedirectUrl(redirectUrl string) (*NoServerAuth, error) {
+	parsedUrl, e := url.Parse(redirectUrl)
+	if e != nil {
+		return nil, e
+	}
+	portStr := parsedUrl.Port()
+	if portStr == "" {
+		if parsedUrl.Scheme == "https" {
+			portStr = "443"
+		} else {
+			portStr = "80"
+		}
+	}
+	port, e := strconv.Atoi(portStr)
+	if e != nil {
+		return nil, e
+	}
+	return &NoServerAuth{
+		ip:           parsedUrl.Hostname(),
+		redirectPath: parsedUrl.Path,
+		deviceName:   "",
+		port:         port,
+		authTimeout:  120,
+	}, nil
+}
 
 type AuthenticateUserOption func(*AuthenticateUserFuncConfig) error
 type AuthenticateUserFuncConfig struct {
@@ -47,7 +88,7 @@ func WithAuthCallHTTPParams(values url.Values) AuthenticateUserOption {
 }
 
 // AuthenticateUser starts the login process
-func AuthenticateUser(oauthConfig *oauth2.Config, options ...AuthenticateUserOption) (*AuthorizedClient, error) {
+func (nsa *NoServerAuth) AuthenticateUser(oauthConfig *oauth2.Config, options ...AuthenticateUserOption) (*AuthorizedClient, error) {
 	// validate params
 	if oauthConfig == nil {
 		return nil, stacktrace.NewError("oauthConfig can't be nil")
@@ -57,7 +98,7 @@ func AuthenticateUser(oauthConfig *oauth2.Config, options ...AuthenticateUserOpt
 	for _, processConfigFunc := range options {
 		processConfigFunc(&optionsConfig)
 	}
-
+	
 	// add transport for self-signed certificate to context
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
@@ -67,8 +108,11 @@ func AuthenticateUser(oauthConfig *oauth2.Config, options ...AuthenticateUserOpt
 
 	// Redirect user to consent page to ask for permission
 	// for the scopes specified above.
-	oauthConfig.RedirectURL = fmt.Sprintf("http://%s:%s/oauth/callback", IP, strconv.Itoa(PORT))
-
+	alterRedirect := oauthConfig.RedirectURL == ""
+	if alterRedirect {
+		oauthConfig.RedirectURL = fmt.Sprintf("http://%s:%s%s", nsa.ip, strconv.Itoa(nsa.port), nsa.redirectPath)
+	}
+	
 	// Some random string, random for each request
 	oauthStateString := rndm.String(8)
 	ctx = context.WithValue(ctx, oauthStateStringContextKey, oauthStateString)
@@ -87,11 +131,11 @@ func AuthenticateUser(oauthConfig *oauth2.Config, options ...AuthenticateUserOpt
 		urlString = parsedURL.String()
 	}
 
-	if IP != "127.0.0.1" {
-		urlString = fmt.Sprintf("%s&device_id=%s&device_name=%s", urlString, DEVICE_NAME, DEVICE_NAME)
+	if alterRedirect && nsa.ip != "127.0.0.1" {
+		urlString = fmt.Sprintf("%s&device_id=%s&device_name=%s", urlString, nsa.deviceName, nsa.deviceName)
 	}
 
-	clientChan, stopHTTPServerChan, cancelAuthentication := startHTTPServer(ctx, oauthConfig)
+	clientChan, stopHTTPServerChan, cancelAuthentication := nsa.startHTTPServer(ctx, oauthConfig)
 	log.Println(color.CyanString("You will now be taken to your browser for authentication or open the url below in a browser."))
 	log.Println(color.CyanString(urlString))
 	log.Println(color.CyanString("If you are opening the url manually on a different machine you will need to curl the result url on this machine manually."))
@@ -104,8 +148,8 @@ func AuthenticateUser(oauthConfig *oauth2.Config, options ...AuthenticateUserOpt
 
 	// shutdown the server after timeout
 	go func() {
-		log.Printf("Authentication will be cancelled in %s seconds", strconv.Itoa(authTimeout))
-		time.Sleep(authTimeout * time.Second)
+		log.Printf("Authentication will be cancelled in %s seconds", strconv.Itoa(int(nsa.authTimeout)))
+		time.Sleep(nsa.authTimeout * time.Second)
 		stopHTTPServerChan <- struct{}{}
 	}()
 
@@ -122,14 +166,14 @@ func AuthenticateUser(oauthConfig *oauth2.Config, options ...AuthenticateUserOpt
 	}
 }
 
-func startHTTPServer(ctx context.Context, conf *oauth2.Config) (clientChan chan *AuthorizedClient, stopHTTPServerChan chan struct{}, cancelAuthentication chan struct{}) {
+func (nsa *NoServerAuth) startHTTPServer(ctx context.Context, conf *oauth2.Config) (clientChan chan *AuthorizedClient, stopHTTPServerChan chan struct{}, cancelAuthentication chan struct{}) {
 	// init returns
 	clientChan = make(chan *AuthorizedClient)
 	stopHTTPServerChan = make(chan struct{})
 	cancelAuthentication = make(chan struct{})
 
-	http.HandleFunc("/oauth/callback", callbackHandler(ctx, conf, clientChan))
-	srv := &http.Server{Addr: ":" + strconv.Itoa(PORT)}
+	http.HandleFunc(nsa.redirectPath, nsa.callbackHandler(ctx, conf, clientChan))
+	srv := &http.Server{Addr: ":" + strconv.Itoa(nsa.port)}
 
 	// handle server shutdown signal
 	go func() {
@@ -161,7 +205,7 @@ func startHTTPServer(ctx context.Context, conf *oauth2.Config) (clientChan chan 
 	return clientChan, stopHTTPServerChan, cancelAuthentication
 }
 
-func callbackHandler(ctx context.Context, oauthConfig *oauth2.Config, clientChan chan *AuthorizedClient) func(w http.ResponseWriter, r *http.Request) {
+func (nsa *NoServerAuth) callbackHandler(ctx context.Context, oauthConfig *oauth2.Config, clientChan chan *AuthorizedClient) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		requestStateString := ctx.Value(oauthStateStringContextKey).(string)
 		responseStateString := r.FormValue("state")
